@@ -1,105 +1,114 @@
 # civ_kernel.py — Minimal runnable kernel for VVL-AGI 1.0
+# --------------------------------------------------------
+# This file implements a tiny, self-contained version of the
+# VVL-AGI control kernel:
+#   - a very simplified structural potential Omega-GC
+#   - a single intensity cap (rho_max) as a VVL-like valve
+#   - a one-step QP controller with box constraints
+#
+# The goal is NOT to be numerically accurate, but to provide
+# a minimal, auditable example that shows:
+#   - the controller tries to track u_des
+#   - while penalising increases in structural imbalance.
+
 import numpy as np
 import cvxpy as cp
 
 
 class VVLAGI:
     """
-    Minimal kernel for VVL-AGI 1.0.
+    Minimal VVL-AGI 1.0 kernel for toy examples.
 
-    This class implements a very small, self-contained version of the
-    VVL-AGI control idea, intended only for toy demonstrations:
-
-    - Omega-GC structural potential (highly simplified)
-    - VVL-style intensity cap (rho_max)
-    - Single-step QP with box constraints
-
-    It is used in toy examples to show the basic "stabilising" behaviour
-    of the CivKernel, not as a production implementation.
+    Attributes
+    ----------
+    rho_max : float
+        Global cap on action magnitude (VVL-style intensity bound).
+    omega : float
+        Current structural potential (for logging only in this minimal demo).
     """
 
     def __init__(self, rho_max: float = 0.95, omega0: float = 0.0) -> None:
-        """
-        Parameters
-        ----------
-        rho_max : float
-            Maximum absolute intensity allowed on each control dimension.
-            This corresponds to the VVL cap (ρ_max ≤ 0.95 in the paper).
-        omega0 : float
-            Initial structural potential value. In this toy version we
-            only track the current value for illustration.
-        """
-        self.rho_max = rho_max
-        self.omega = omega0
+        self.rho_max = float(rho_max)
+        self.omega = float(omega0)
 
+    # ------------------------------------------------------------------
+    #  Simplified structural potential Omega-GC (pure numpy, no cvxpy)
+    # ------------------------------------------------------------------
     def omega_gc(self, g):
         """
-        Simplified structural potential Ω(g).
+        Compute a very simple structural potential Omega.
 
         Parameters
         ----------
-        g : array-like of length 6
-            Imbalance vector [g_S, g_U, g_I, g_H, g_E, g_D].
+        g : array-like
+            Imbalance vector. In the paper this corresponds to
+            gaps on (S, U, I, H, E, D). Here we accept any length
+            and use a smooth penalty.
 
         Returns
         -------
         float
-            Structural potential Ω(g). Larger values mean "further away"
-            from the desired civilizational region.
+            Structural potential Omega(g).
         """
-        g = np.asarray(g, dtype=float)
+        g = np.asarray(g, dtype=float).ravel()
+        if g.size == 0:
+            return 0.0
 
-        # Base linear term over all six gaps
         base = np.sum(g)
-
-        # Simple interaction term between H and D components
-        hd = 2.0 * g[3] * g[5]
-
-        # Smooth penalty that grows quickly when total imbalance is large
+        # If we have at least 4 components, add a simple interaction term.
+        if g.size >= 4:
+            hd = 2.0 * g[3] * g[-1]
+        else:
+            hd = 0.0
         logits = 2.0 * np.sum(g) - 1.0
         smooth = np.log(1.0 + np.exp(logits))
-
         return float(base + hd + smooth)
 
+    # ------------------------------------------------------------------
+    #  One-step QP controller
+    # ------------------------------------------------------------------
     def step(self, x, u_des, g):
         """
-        One-step control with a very small QP.
+        Compute a safe action for one step.
 
         Parameters
         ----------
         x : array-like
-            Current state. In this toy implementation it is unused and
-            kept only for interface completeness.
+            Current state (unused in this minimal demo, but kept
+            for API compatibility).
         u_des : array-like
-            Desired action suggested by the underlying task model
-            (e.g., "push more engagement / emotion" in a recommender).
+            Desired action from the task-level objective. In a
+            recommender setting this can be “raw” preference
+            towards engagement / emotion.
         g : array-like
-            Current structural imbalance vector (same format as in
-            `omega_gc`).
+            Current structural gap vector used by Omega-GC.
 
         Returns
         -------
-        numpy.ndarray
-            Controlled action u_t after applying VVL caps and Ω-based
-            penalty. If the QP fails to solve, falls back to a clipped
-            version of u_des.
+        np.ndarray
+            Chosen action u_t after applying VVL cap and Omega penalty.
         """
-        u_des = np.asarray(u_des, dtype=float)
-        n = len(u_des)
+        u_des = np.asarray(u_des, dtype=float).ravel()
+        n = u_des.size
+        if n == 0:
+            return np.zeros(0, dtype=float)
+
         u = cp.Variable(n)
 
-        # Very simple objective:
-        #   1) stay close to u_des
-        #   2) penalize any increase in structural potential Ω
+        # Current structural potential (numeric, no cvxpy inside).
         omega_now = self.omega_gc(g)
-        omega_next = self.omega_gc(g + 0.1 * u)  # crude first-order proxy
+
+        # We do NOT pass u into omega_gc to avoid shape / type issues.
+        # Instead, we use the squared norm of u as a crude proxy for
+        # “how much we push the structure”, and penalise any increase
+        # over the current omega.
+        omega_proxy = omega_now + 0.1 * cp.sum_squares(u)
 
         cost = (
             0.5 * cp.sum_squares(u - u_des)
-            + 10.0 * cp.maximum(omega_next - omega_now, 0)
+            + 10.0 * cp.pos(omega_proxy - omega_now)
         )
 
-        # VVL-style intensity caps (box constraints)
         constraints = [
             u >= -self.rho_max,
             u <= self.rho_max,
@@ -109,11 +118,16 @@ class VVLAGI:
         try:
             prob.solve(solver=cp.OSQP)
         except Exception:
-            # If the solver fails, fall back to a safely clipped u_des
+            # If the solver fails for any reason, fall back to a clipped
+            # version of the desired action. This keeps the demo robust.
             return np.clip(u_des, -0.9, 0.9)
 
         if u.value is None:
-            # Another safety fallback in case the solver returns no value
             return np.clip(u_des, -0.9, 0.9)
 
-        return np.array(u.value, dtype=float).reshape(-1)
+        u_val = np.array(u.value, dtype=float).ravel()
+
+        # Update omega for logging (not strictly necessary in this toy demo).
+        self.omega = self.omega_gc(g)
+
+        return u_val
