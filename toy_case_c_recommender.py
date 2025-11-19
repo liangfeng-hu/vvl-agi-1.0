@@ -1,47 +1,109 @@
-# toy_case_c_recommender.py — Case C 演示脚本
+"""
+toy_case_c_recommender.py — Tiny toy environment for Case C (recommender governance)
+
+State (9D):
+    [S, U, I, H, E, D, ViewCov, DepRisk, PolRisk]
+
+At each step:
+- The underlying model proposes a "greedy" action u_des that maximises
+  engagement and emotional arousal.
+- The VVLAGI kernel wraps this proposal and produces a safer control u_ctrl.
+- We update the structural indicators in a crude way and record Omega and DepRisk.
+
+Run:
+
+    python toy_case_c_recommender.py
+
+You should see Omega gradually decrease and DepRisk stay bounded.
+"""
+
 import numpy as np
+import matplotlib.pyplot as plt
+
 from civ_kernel import VVLAGI
 
 
-def simulate_case_c(T=100):
+def update_state(g: np.ndarray, u_ctrl: np.ndarray) -> np.ndarray:
     """
-    简化版 Case C：
-    - g: [g_S, g_U, g_I, g_H, g_E, g_D] 六维失衡
-    - u_des: 想要“推高点击+情绪”的原始动作
-    - kernel.step: 在 VVL+Omega 约束下给出安全 u_t
+    Crude state update for the toy example.
+
+    Parameters
+    ----------
+    g : np.ndarray
+        6D structural indicators [S,U,I,H,E,D] in [0,1].
+    u_ctrl : np.ndarray
+        Governed control action.
+
+    Returns
+    -------
+    np.ndarray
+        Updated structural indicators g_next.
     """
+    g = g.copy()
+    u1, u2, u3 = u_ctrl
+
+    # U: well-being increases with u1 but too much action increases H and D.
+    g[1] = np.clip(g[1] + 0.05 * u1, 0.0, 1.0)
+    g[3] = np.clip(g[3] + 0.03 * max(u1, 0.0), 0.0, 1.0)  # tail risk
+    g[5] = np.clip(g[5] + 0.03 * max(u1, 0.0), 0.0, 1.0)  # drift
+
+    # S and I: slightly improve when actions are moderate.
+    g[0] = np.clip(g[0] + 0.02 * (1.0 - abs(u2)), 0.0, 1.0)
+    g[2] = np.clip(g[2] + 0.02 * (1.0 - abs(u3)), 0.0, 1.0)
+
+    # E: evidence coverage decreases if we push too aggressively.
+    g[4] = np.clip(g[4] - 0.04 * (abs(u1) + abs(u2)), 0.0, 1.0)
+
+    # Small natural recovery towards a neutral baseline.
+    g = 0.98 * g + 0.02 * 0.5
+
+    return g
+
+
+def main():
     kernel = VVLAGI()
-    # 初始失衡：H, D 比较大，表示尾部风险高、漂移大
-    g = np.array([0.2, 0.3, 0.2, 0.8, 0.4, 0.7])
-    x = np.zeros(3)  # 状态占位
-    u_des = np.array([0.8, 0.9, -0.5])  # 想推高 engagement、情绪，压制多样性
+    # Initial 6D indicators [S,U,I,H,E,D]
+    g = np.array([0.5, 0.5, 0.5, 0.4, 0.6, 0.4], dtype=float)
 
-    omega_list = []
-    dep_list = []
-    viewcov_list = []
+    # Underlying model's greedy action (too aggressive)
+    u_des = np.array([0.9, 0.8, -0.7], dtype=float)
 
-    for t in range(T):
-        u = kernel.step(x, u_des, g)
+    omegas = []
+    deprisks = []
 
-        # 简单的“环境响应”：u 越大，DepRisk 越高，ViewCov 越低
-        dep_risk = 0.5 + 0.3 * u[0]  # 假设与第一个维度相关
-        view_cov = 0.5 - 0.2 * u[1]  # 与第二个维度反向
-        dep_risk = float(np.clip(dep_risk, 0, 1))
-        view_cov = float(np.clip(view_cov, 0, 1))
-
-        # 用 DepRisk / ViewCov 反向更新结构失衡 g（只是 toy 逻辑）
-        g[3] = dep_risk        # g_H
-        g[5] = 1 - view_cov    # g_D
-
+    for t in range(200):
         omega = kernel.omega_gc(g)
-        omega_list.append(omega)
-        dep_list.append(dep_risk)
-        viewcov_list.append(view_cov)
+        omegas.append(omega)
 
-        print(f"t={t:03d}  u={u}  Ω={omega:.3f}  DepRisk={dep_risk:.3f}  ViewCov={view_cov:.3f}")
+        deprisk = 0.5 * g[1] + 0.5 * g[3]
+        deprisks.append(deprisk)
 
-    return np.array(omega_list), np.array(dep_list), np.array(viewcov_list)
+        u_ctrl = kernel.step(g, u_des, g)
+
+        print(
+            f"Step {t:3d}: Omega={omega:6.3f}, DepRisk={deprisk:5.3f}, "
+            f"u_des={u_des}, u_ctrl={u_ctrl}"
+        )
+
+        g = update_state(g, u_ctrl)
+
+    steps = np.arange(len(omegas))
+    fig, ax1 = plt.subplots(figsize=(8, 4))
+
+    ax1.set_xlabel("step")
+    ax1.set_ylabel("Omega", color="tab:red")
+    ax1.plot(steps, omegas, color="tab:red", label="Omega")
+    ax1.tick_params(axis="y", labelcolor="tab:red")
+
+    ax2 = ax1.twinx()
+    ax2.set_ylabel("DepRisk", color="tab:blue")
+    ax2.plot(steps, deprisks, color="tab:blue", linestyle="--", label="DepRisk")
+    ax2.tick_params(axis="y", labelcolor="tab:blue")
+
+    fig.tight_layout()
+    plt.title("Toy Case C: Omega and DepRisk under governed control")
+    plt.show()
 
 
 if __name__ == "__main__":
-    simulate_case_c(T=50)
+    main()
